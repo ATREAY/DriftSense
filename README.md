@@ -1,4 +1,4 @@
-# DriftSense — Navigation-Error Recovery for Semiconductor Wafer Inspection
+# DriftSense - Navigation-Error Recovery for Semiconductor Wafer Inspection
 
 A template-localization system for the Applied Materials hackathon track
 "Drift-Sense: Navigation-Error Recovery." Given a high-magnification
@@ -8,7 +8,7 @@ area, DriftSense predicts the pixel `(x, y)` center where the reference
 pattern reappears (shrunk ~10x) inside the search image.
 
 This is **not** an image-restoration task (see the related `WaferRestore`
-project for that KLA problem) — it's template matching / localization
+project for that KLA problem) it's template matching / localization
 under realistic SEM degradation and scale mismatch.
 
 ## Why this approach (not simple template matching)
@@ -16,7 +16,7 @@ under realistic SEM degradation and scale mismatch.
 Classical normalized cross-correlation (NCC) template matching fails on
 these images for two reasons this dataset is deliberately built to
 expose: (1) DRAM/FinFET layouts are near-perfectly periodic, so NCC
-produces many equally-strong peaks at every lattice period — the position
+produces many equally-strong peaks at every lattice period the position
 is only disambiguated by non-periodic global context (die-level dose/
 shading variation), which a local template-matching score can't see but
 a CNN with a large receptive field over the whole search image can; and
@@ -68,13 +68,13 @@ Key flags:
 - `--output-dir DIR` — writes `reference/*.png`, `search/*.png`,
   `manifest.json` (ground-truth center + every generation parameter per
   pair, for full reproducibility)
-- `--harder-noise` — widen the search-image noise range (used to build
+- `--harder-noise` - widen the search-image noise range (used to build
   a validation split that's noisier than training, matching how the
   organizers' held-out test set is described)
-- `--ambiguous-prob P` — fraction of samples with ~0 shading cue, i.e.
+- `--ambiguous-prob P` - fraction of samples with ~0 shading cue, i.e.
   the genuinely-hard fully-periodic case the problem statement requires
   at least one instance of
-- `--workers N` — CPU-parallel generation (each pair is independent)
+- `--workers N` - CPU-parallel generation (each pair is independent)
 
 On a shared cluster, don't run large batches on the login node — use
 `training/slurm_generate.sh <output_dir> <num_pairs> [architecture]`,
