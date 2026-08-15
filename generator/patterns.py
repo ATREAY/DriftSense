@@ -74,6 +74,61 @@ def render_finfet(x: np.ndarray, y: np.ndarray, params: dict) -> np.ndarray:
 
 RENDERERS = {"dram": render_dram, "finfet": render_finfet}
 
+# Real chips are not one uniform repeating pattern across a whole field of
+# view: a memory/logic device is built from discrete sub-array "mats"
+# (blocks of the periodic cell array) separated by strips of visually
+# distinct material -- peripheral circuitry, sense-amp/decoder rows,
+# global routing. Diagnosed directly against the reference scaffold
+# (aayushraina21/drift-sense-synthetic-data, src/patterns/zones.py): its
+# classical ZNCC baseline reaches 60-75% accuracy at <=5px specifically
+# because most crops straddle (or are deliberately biased to straddle) a
+# mat/strip boundary, giving genuine non-periodic local structure to
+# match against -- not because of noise calibration or a smooth global
+# cue. An earlier version of this generator used one uniform periodic
+# pattern per sample (plus a weak smooth shading field), which measured
+# at true-match NCC scores statistically indistinguishable from
+# random-offset scores (~0.15 vs. up to ~0.43, effectively tied) --
+# mat/strip zoning is the actual fix, not a noise-level tweak.
+MAT_SIZE_NM = 2600.0
+STRIP_WIDTH_NM = 320.0
+_ZONE_PERIOD = MAT_SIZE_NM + STRIP_WIDTH_NM
+
+
+def _in_strip(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    xm = np.mod(x, _ZONE_PERIOD)
+    ym = np.mod(y, _ZONE_PERIOD)
+    return (xm >= MAT_SIZE_NM) | (ym >= MAT_SIZE_NM)
+
+
+def _mat_cell_parity(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Checkerboard parity of which mat cell (x, y) falls in. A single
+    fixed preset repeated identically in every mat cell is itself exactly
+    periodic at the zone scale (every ~2920nm), which just moves the tie-
+    breaking problem up a level instead of solving it -- real floorplans
+    don't tile one identical block forever either. Alternating between two
+    presets breaks that repeat the same way src/patterns/zones.py's
+    per-mat random preset choice does, simplified to two presets on a
+    checkerboard (deterministic, cheap to compute per-pixel) rather than
+    a full per-cell random draw."""
+    ci = np.floor(x / _ZONE_PERIOD)
+    cj = np.floor(y / _ZONE_PERIOD)
+    return np.mod(ci + cj, 2).astype(np.int32)
+
+
+def render_strip(x: np.ndarray, y: np.ndarray, params: dict) -> np.ndarray:
+    """Flat routing/peripheral-material fill with sparse orthogonal
+    interconnect lines -- visually distinct from the dense periodic mats
+    it separates, matching the reference scaffold's strip texture."""
+    base = params["strip_base"]
+    line = params["strip_line"]
+    pitch = params["strip_line_pitch"]
+    width_frac = params["strip_line_width_frac"]
+    phase = params["strip_phase"]
+    rows = _periodic_lines(y - phase, pitch, width_frac)
+    cols = _periodic_lines(x - phase, pitch, width_frac)
+    routing = np.clip(rows + cols, 0, 1)
+    return base + routing * (line - base)
+
 
 def _sample_field(rng: np.random.Generator, n_components: int, wavelength_range: tuple,
                    amplitude: float) -> list[dict]:
@@ -106,50 +161,65 @@ def _apply_field(x: np.ndarray, y: np.ndarray, field: list[dict]) -> np.ndarray:
     return out
 
 
-def default_params(arch: str, rng: np.random.Generator, *, field_amplitude: float = 0.15) -> dict:
-    """Randomize structural parameters per sample so no two layouts are
-    pixel-identical, while keeping them within realistic device ranges.
-    `field_amplitude` sets the strength of the non-periodic shading cue
-    (see `_sample_field`); pass ~0 to generate a maximally-ambiguous,
-    fully-periodic hard case.
-    """
-    # Pitches are picked so that after the MAG_RATIO=10x zoom-out to search
-    # magnification the period is still a few pixels wide (weakly
-    # resolvable, matching "the reference pattern appears shrunk ~10x
-    # somewhere inside" rather than fully aliasing away into flat noise).
+def _structural_params(arch: str, rng: np.random.Generator, family: str) -> dict:
     if arch == "dram":
-        params = dict(
-            pitch=float(rng.uniform(70, 100)),
-            line_width_frac=float(rng.uniform(0.16, 0.24)),
-            via_radius_frac=float(rng.uniform(0.14, 0.20)),
+        from generator.presets import get_preset
+        params = get_preset("dram", family)
+        params.update(
             background=float(rng.uniform(0.12, 0.22)),
             line_level=float(rng.uniform(0.55, 0.70)),
             via_level=float(rng.uniform(0.85, 1.0)),
         )
     elif arch == "finfet":
-        params = dict(
-            fin_pitch=float(rng.uniform(70, 100)),
-            fin_width_frac=float(rng.uniform(0.30, 0.42)),
-            gate_pitch=float(rng.uniform(500, 700)),
-            gate_width_frac=float(rng.uniform(0.10, 0.16)),
+        from generator.presets import get_preset
+        params = get_preset("finfet", family)
+        params.update(
             background=float(rng.uniform(0.10, 0.20)),
             fin_level=float(rng.uniform(0.55, 0.68)),
             gate_level=float(rng.uniform(0.85, 1.0)),
         )
     else:
         raise ValueError(f"unknown arch {arch!r}")
-    # Wavelengths are kept comparable to (not much larger than) the
-    # reference's own 1000-unit physical footprint: if a period is far
-    # wider than what the reference can see, the reference only samples a
-    # near-linear sliver of the field and can't encode a genuinely
-    # matchable positional "fingerprint" from it (empirically this made
-    # v1/v2 models fail to generalize past training-set memorization even
-    # though the underlying architecture could learn -- see experiments/
-    # dram_finfet_v1 and _v2 history). Shorter wavelengths let the
-    # reference capture enough of a cycle (peak/trough/slope) to be
-    # locally distinctive.
+    return params
+
+
+def default_params(arch: str, rng: np.random.Generator, *, family: str,
+                    field_amplitude: float = 0.06) -> dict:
+    """Structural geometry (pitch, width fractions) comes from a fixed
+    preset `family` (see generator/presets.py) rather than being drawn
+    fresh per sample -- earlier fully-randomized geometry made the
+    localization task unlearnable from a few thousand pairs (see README
+    "Current results", v1-v4). Only imaging-condition brightness levels
+    are still randomized per sample: those represent detector gain /
+    contrast-brightness settings that legitimately vary capture-to-
+    capture, and a network needs to be invariant to them regardless.
+
+    A second "neighbor" preset (`params["mat_b"]`) is also generated for
+    the checkerboard mat-cell alternation in `render_region` -- a single
+    preset tiled identically in every mat cell is itself exactly periodic
+    at the zone scale, see `_mat_cell_parity`.
+
+    `field_amplitude` sets the strength of an additional smooth
+    non-periodic shading cue (see `_sample_field`); kept low by default
+    now that fixed-family/zone structure is the primary learnable signal,
+    not the sole one. Pass 0 for the fully-ambiguous periodic-only hard case.
+    """
+    from generator.presets import preset_names
+    params = _structural_params(arch, rng, family)
+
+    other_families = [f for f in preset_names(arch) if f != family]
+    neighbor_family = str(rng.choice(other_families)) if other_families else family
+    params["mat_b"] = _structural_params(arch, rng, neighbor_family)
+
     params["field"] = _sample_field(rng, n_components=4, wavelength_range=(700, 1900),
                                      amplitude=field_amplitude)
+    params.update(
+        strip_base=float(rng.uniform(0.32, 0.40)),
+        strip_line=float(rng.uniform(0.48, 0.56)),
+        strip_line_pitch=float(rng.uniform(180, 260)),
+        strip_line_width_frac=float(rng.uniform(0.03, 0.06)),
+        strip_phase=float(rng.uniform(0, 220)),
+    )
     return params
 
 
@@ -179,7 +249,11 @@ def render_region(arch: str, params: dict, ox: float, oy: float, size: int, step
             y = oy + coords_y[:, None]
             x = np.broadcast_to(x, (size, size))
             y = np.broadcast_to(y, (size, size))
-            sample = RENDERERS[arch](x, y, params)
+            mat_sample_a = RENDERERS[arch](x, y, params)
+            mat_sample_b = RENDERERS[arch](x, y, params["mat_b"])
+            mat_sample = np.where(_mat_cell_parity(x, y) == 0, mat_sample_a, mat_sample_b)
+            strip_sample = render_strip(x, y, params)
+            sample = np.where(_in_strip(x, y), strip_sample, mat_sample)
             if params.get("field"):
                 sample = sample + _apply_field(x, y, params["field"])
             acc += sample

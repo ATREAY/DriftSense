@@ -1,7 +1,7 @@
 train_dir: data/train
 val_dir: data/val
-output_dir: experiments/dram_finfet_v4
-epochs: 200
+output_dir: experiments/dram_finfet_v5
+epochs: 150
 batch_size: 16
 lr: 0.001
 num_workers: 8

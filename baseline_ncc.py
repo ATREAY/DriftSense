@@ -29,14 +29,28 @@ def load_gray(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
 
 
-def ncc_localize(reference: np.ndarray, search: np.ndarray, mag_ratio: int = 10):
+def ncc_localize(reference: np.ndarray, search: np.ndarray, mag_ratio: float = 10.0,
+                  scale_sweep=(9.0, 9.5, 10.0, 10.5, 11.0)):
+    """Multi-scale NCC: the true magnification ratio is only known
+    approximately (independent rotation/scale jitter is applied to
+    reference and search separately during dataset generation, see
+    generator/augment.py), so a single fixed-scale template can miss by
+    a few percent. Sweeping a small range around the nominal ratio, like
+    the reference scaffold's baseline_solution/zncc.py, recovers most of
+    that loss without any training.
+    """
     ref_h, ref_w = reference.shape
-    template_size = max(8, round(ref_h / mag_ratio)), max(8, round(ref_w / mag_ratio))
-    template = resize(reference, template_size, anti_aliasing=True)
-
-    result = match_template(search, template, pad_input=True)
-    peak = np.unravel_index(np.argmax(result), result.shape)
-    return float(peak[1]), float(peak[0])  # (x, y)
+    best_score, best_xy = -np.inf, (0.0, 0.0)
+    for scale in scale_sweep:
+        template_size = max(8, round(ref_h / scale)), max(8, round(ref_w / scale))
+        template = resize(reference, template_size, anti_aliasing=True)
+        result = match_template(search, template, pad_input=True)
+        idx = np.unravel_index(np.argmax(result), result.shape)
+        score = result[idx]
+        if score > best_score:
+            best_score = score
+            best_xy = (float(idx[1]), float(idx[0]))
+    return best_xy
 
 
 def main():

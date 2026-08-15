@@ -4,7 +4,9 @@
 Generates (reference, search, ground-truth-center) triples for the
 Applied Materials "Drift-Sense" localization task. Every pair:
   - Reference: 1000x1000 px, native-magnification DRAM-style or
-    FinFET-style layout.
+    FinFET-style layout, drawn from one of a small fixed pool of
+    structural presets (see generator/presets.py) rather than fully
+    randomized geometry -- see the module docstring there for why.
   - Search: 1000x1000 px, rendered from the *same* physical region at
     MAG_RATIO x lower magnification (i.e. covering MAG_RATIO^2 more
     physical area), so the reference content reappears shrunk by
@@ -13,11 +15,19 @@ Applied Materials "Drift-Sense" localization task. Every pair:
   - Ground truth: the (x, y) pixel center of the reference pattern inside
     the search image, computed analytically from the shared coordinate
     system (not estimated), then carried through independent geometric
-    jitter applied to the search image so it stays exact.
+    jitter applied to the search image so it stays exact. A gt_box
+    (top-left x, y, w, h) is also recorded, matching the reference
+    scaffold's manifest schema.
 
 Usage:
   python generator/generate_dataset.py --architecture dram --num-pairs 40 \
       --output-dir data/train
+
+Writes both manifest.json (rich, nested -- used by this repo's own
+training/eval code) and manifest.csv (flat columns: id, reference_path,
+search_path, gt_x, gt_y, gt_box_x, gt_box_y, gt_box_w, gt_box_h,
+architecture, family, seed, ...) for compatibility with the reference
+scaffold's conventions.
 
 See docs/CITATIONS.md for the references backing every noise/augmentation
 choice made in generator/noise.py and generator/augment.py.
@@ -25,6 +35,7 @@ choice made in generator/noise.py and generator/augment.py.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 import time
@@ -37,10 +48,12 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from generator import augment, noise, patterns  # noqa: E402
+from generator.presets import preset_names  # noqa: E402
 
 MAG_RATIO = 10
 REF_SIZE = 1000
 SEARCH_SIZE = 1000
+GT_BOX_SIZE = REF_SIZE // MAG_RATIO  # 100 -- matches reference scaffold
 MARGIN_PX = 60  # keep embedded reference center away from search borders
 
 
@@ -48,15 +61,38 @@ def to_uint8(img: np.ndarray) -> np.ndarray:
     return (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
 
+def _biased_crop_origin(rng: np.random.Generator, boundary_bias: float) -> tuple[float, float]:
+    """With probability `boundary_bias`, bias an axis to land near a
+    mat/strip zone boundary (see patterns.MAT_SIZE_NM/STRIP_WIDTH_NM) so
+    the reference crop straddles it -- non-periodic structure that is the
+    actual disambiguating signal (diagnosed against the reference
+    scaffold's src/patterns/zones.py + baseline_solution/zncc.py: its
+    60-75%@5px accuracy comes from exactly this boundary-straddling bias,
+    not from noise calibration or a smooth shading cue). Otherwise
+    uniform-random, which -- since REF_SIZE (1000) is a meaningful
+    fraction of MAT_SIZE_NM (2600) -- still lands near a boundary somewhat
+    often by chance, matching the reference implementation's behavior.
+    """
+    def one_axis() -> float:
+        if rng.random() < boundary_bias:
+            period = patterns.MAT_SIZE_NM + patterns.STRIP_WIDTH_NM
+            k = int(rng.integers(0, 8))
+            boundary = k * period + patterns.MAT_SIZE_NM
+            return max(0.0, boundary + float(rng.uniform(-REF_SIZE / 2, REF_SIZE / 2)))
+        return float(rng.uniform(0, 20000))
+    return one_axis(), one_axis()
+
+
 def generate_pair(arch: str, idx: int, rng: np.random.Generator, *,
                    harder_noise: bool, ambiguous_prob: float,
-                   max_rotation_deg: float, max_scale_pct: float) -> dict:
+                   max_rotation_deg: float, max_scale_pct: float,
+                   boundary_bias: float = 0.35) -> dict:
+    family = str(rng.choice(preset_names(arch)))
     ambiguous = rng.random() < ambiguous_prob
-    field_amp = 0.0 if ambiguous else float(rng.uniform(0.10, 0.20))
-    params = patterns.default_params(arch, rng, field_amplitude=field_amp)
+    field_amp = 0.0 if ambiguous else float(rng.uniform(0.03, 0.09))
+    params = patterns.default_params(arch, rng, family=family, field_amplitude=field_amp)
 
-    ref_ox = float(rng.uniform(0, 20000))
-    ref_oy = float(rng.uniform(0, 20000))
+    ref_ox, ref_oy = _biased_crop_origin(rng, 0.0 if ambiguous else boundary_bias)
     ref_center_x = ref_ox + REF_SIZE / 2.0
     ref_center_y = ref_oy + REF_SIZE / 2.0
 
@@ -88,12 +124,20 @@ def generate_pair(arch: str, idx: int, rng: np.random.Generator, *,
         gt_x = float(np.clip(gt_x, 0, SEARCH_SIZE - 1))
         gt_y = float(np.clip(gt_y, 0, SEARCH_SIZE - 1))
 
+    gt_box_x = gt_x - GT_BOX_SIZE / 2.0
+    gt_box_y = gt_y - GT_BOX_SIZE / 2.0
+
     return {
         "id": f"{arch}_{idx:05d}",
         "architecture": arch,
+        "family": family,
         "ambiguous_periodic": ambiguous,
         "gt_x": gt_x,
         "gt_y": gt_y,
+        "gt_box_x": gt_box_x,
+        "gt_box_y": gt_box_y,
+        "gt_box_w": float(GT_BOX_SIZE),
+        "gt_box_h": float(GT_BOX_SIZE),
         "pattern_params": {k: v for k, v in params.items() if k != "field"},
         "field_amplitude": field_amp,
         "reference_jitter": ref_jitter,
@@ -107,12 +151,13 @@ def generate_pair(arch: str, idx: int, rng: np.random.Generator, *,
 
 def _worker(args_tuple):
     (idx, arch, seed_seq, output_dir, harder_noise, ambiguous_prob,
-     max_rotation_deg, max_scale_pct) = args_tuple
+     max_rotation_deg, max_scale_pct, boundary_bias) = args_tuple
     rng = np.random.default_rng(seed_seq)
     rec = generate_pair(
         arch, idx, rng,
         harder_noise=harder_noise, ambiguous_prob=ambiguous_prob,
         max_rotation_deg=max_rotation_deg, max_scale_pct=max_scale_pct,
+        boundary_bias=boundary_bias,
     )
     ref_path = output_dir / "reference" / f"{rec['id']}.png"
     search_path = output_dir / "search" / f"{rec['id']}.png"
@@ -121,6 +166,28 @@ def _worker(args_tuple):
     rec["reference_path"] = str(ref_path.relative_to(output_dir))
     rec["search_path"] = str(search_path.relative_to(output_dir))
     return rec
+
+
+def _flatten_for_csv(rec: dict, seed: int) -> dict:
+    flat = {
+        "id": rec["id"], "reference_path": rec["reference_path"], "search_path": rec["search_path"],
+        "gt_x": rec["gt_x"], "gt_y": rec["gt_y"],
+        "gt_box_x": rec["gt_box_x"], "gt_box_y": rec["gt_box_y"],
+        "gt_box_w": rec["gt_box_w"], "gt_box_h": rec["gt_box_h"],
+        "architecture": rec["architecture"], "family": rec["family"], "seed": seed,
+        "ambiguous_periodic": rec["ambiguous_periodic"], "field_amplitude": rec["field_amplitude"],
+    }
+    for k, v in rec["pattern_params"].items():
+        flat[f"struct_{k}"] = v
+    for k, v in rec["reference_degradation"].items():
+        flat[f"ref_deg_{k}"] = v
+    for k, v in rec["search_degradation"].items():
+        flat[f"search_deg_{k}"] = v
+    for k, v in rec["reference_jitter"].items():
+        flat[f"ref_jitter_{k}"] = v
+    for k, v in rec["search_jitter"].items():
+        flat[f"search_jitter_{k}"] = v
+    return flat
 
 
 def main():
@@ -136,6 +203,10 @@ def main():
                      help="Fraction of samples with ~0 shading cue -> genuinely hard, fully periodic case.")
     ap.add_argument("--max-rotation-deg", type=float, default=3.0)
     ap.add_argument("--max-scale-pct", type=float, default=5.0)
+    ap.add_argument("--boundary-bias", type=float, default=0.35,
+                     help="Probability of deliberately biasing the reference crop to straddle a "
+                          "mat/strip zone boundary (see generator/patterns.py) -- this, not noise "
+                          "calibration, is what makes samples locally disambiguable.")
     ap.add_argument("--workers", type=int, default=1,
                      help="Parallel worker processes (each pair is CPU-bound; use ~num cores).")
     args = ap.parse_args()
@@ -152,7 +223,7 @@ def main():
 
     jobs = [
         (i, arch_for(i), seed_seqs[i], args.output_dir, args.harder_noise,
-         args.ambiguous_prob, args.max_rotation_deg, args.max_scale_pct)
+         args.ambiguous_prob, args.max_rotation_deg, args.max_scale_pct, args.boundary_bias)
         for i in range(args.num_pairs)
     ]
 
@@ -181,7 +252,21 @@ def main():
             "num_pairs": args.num_pairs, "seed": args.seed, "harder_noise": args.harder_noise,
             "pairs": manifest,
         }, f, indent=2)
-    print(f"Wrote {args.num_pairs} pairs + manifest.json to {args.output_dir}")
+
+    flat_rows = [_flatten_for_csv(rec, args.seed) for rec in manifest]
+    fieldnames = sorted({k for row in flat_rows for k in row})
+    fieldnames = [c for c in ["id", "reference_path", "search_path", "gt_x", "gt_y",
+                               "gt_box_x", "gt_box_y", "gt_box_w", "gt_box_h",
+                               "architecture", "family", "seed"] if c in fieldnames] + \
+        sorted(c for c in fieldnames if c not in
+               {"id", "reference_path", "search_path", "gt_x", "gt_y",
+                "gt_box_x", "gt_box_y", "gt_box_w", "gt_box_h", "architecture", "family", "seed"})
+    with open(args.output_dir / "manifest.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(flat_rows)
+
+    print(f"Wrote {args.num_pairs} pairs + manifest.json + manifest.csv to {args.output_dir}")
 
 
 if __name__ == "__main__":
