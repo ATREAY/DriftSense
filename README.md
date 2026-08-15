@@ -171,12 +171,21 @@ epochs on 400 training pairs) is the best of four training attempts on
 this cluster, self-evaluated on 40 held-out, harder-noise pairs
 (`data/self_eval`, `--tolerance-px 100`):
 
-| Metric | Value |
-|---|---|
-| Accuracy within 100px | 10% |
-| Mean error | 333 px |
-| Median error | 323 px |
-| Inference time | ~50 ms/pair (CPU) |
+| Metric | DriftSense (learned) | Classical NCC baseline (`baseline_ncc.py`) |
+|---|---|---|
+| Accuracy within 100px | 10% | 2.5% |
+| Mean error | 333 px | 599 px |
+| Median error | 323 px | 591 px |
+| Inference time | ~50 ms/pair (CPU) | ~130 ms/pair (CPU) |
+
+The classical baseline (`skimage.feature.match_template`, reference
+downsampled by the known 10x magnification ratio, single best NCC peak)
+is included precisely to test the README's opening claim rather than
+just assert it: DriftSense's learned model is ~45% lower mean error and
+4x the within-tolerance accuracy of plain template matching, consistent
+with periodic aliasing genuinely defeating single-peak NCC on this data.
+Neither number is competition-ready, but the comparison is real and
+reproducible (`python baseline_ncc.py --data-dir data/self_eval`).
 
 **This is not a solved localization problem.** It is meaningfully better
 than the untrained/collapsed baseline (see below) but still close to
