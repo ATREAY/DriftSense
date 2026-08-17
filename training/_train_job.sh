@@ -2,8 +2,8 @@
 #SBATCH --job-name=driftsense
 #SBATCH --partition=cse-gpu-all
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=48G
 #SBATCH --time=12:00:00
 #SBATCH --output=%x_%j.log
 # --nodelist is appended at submission time by slurm_train.sh, which picks

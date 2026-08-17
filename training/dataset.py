@@ -7,6 +7,17 @@ models/siamese_localizer.py:localize):
   - "refine": a native-resolution crop around the true target, offset by a
     random jitter (simulating "the coarse pass landed nearby but not
     exactly on target"), upsampled to network input.
+
+Images are decoded once at dataset construction and cached in RAM as
+uint8 arrays (~1MB/image; a 5000-pair train split is ~10GB, well within a
+single Slurm job's memory request). This matters specifically on shared
+multi-tenant DGX nodes on this cluster (e.g. dgx-a100-02), which have no
+per-job CPU isolation -- a plain per-epoch disk-read + PNG-decode
+DataLoader gets starved badly enough there to make a "faster" GPU tier
+much slower wall-clock than an uncontended one (same fix used in the
+sibling WaferRestore project's README, Incident 2). The cache is built
+before DataLoader worker processes fork, so workers share it via
+copy-on-write with no extra memory cost per worker.
 """
 from __future__ import annotations
 
@@ -25,15 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.siamese_localizer import EXEMPLAR_INPUT, SEARCH_INPUT, ENCODER_STRIDE, SiameseLocalizer
 
 
-def _load_gray(path: Path) -> torch.Tensor:
-    img = Image.open(path).convert("L")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    return torch.from_numpy(arr).unsqueeze(0)  # (1, H, W)
+def _load_uint8(path: Path) -> np.ndarray:
+    return np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
 
 
 class DriftSenseDataset(Dataset):
     def __init__(self, data_dir: str | Path, refine_prob: float = 0.5,
-                 refine_window_range=(150, 300), refine_jitter_frac: float = 0.35):
+                 refine_window_range=(150, 300), refine_jitter_frac: float = 0.35,
+                 cache_in_ram: bool = True):
         self.data_dir = Path(data_dir)
         manifest = json.loads((self.data_dir / "manifest.json").read_text())
         self.pairs = manifest["pairs"]
@@ -43,13 +53,28 @@ class DriftSenseDataset(Dataset):
         self.refine_jitter_frac = refine_jitter_frac
         self.ef_size = EXEMPLAR_INPUT // ENCODER_STRIDE
 
+        self._cache: dict[str, np.ndarray] | None = None
+        if cache_in_ram:
+            self._cache = {}
+            for rec in self.pairs:
+                for key in ("reference_path", "search_path"):
+                    p = str(self.data_dir / rec[key])
+                    self._cache[p] = _load_uint8(self.data_dir / rec[key])
+
+    def _load_gray(self, path: Path) -> torch.Tensor:
+        if self._cache is not None:
+            arr = self._cache[str(path)]
+        else:
+            arr = _load_uint8(path)
+        return torch.from_numpy(arr.astype(np.float32) / 255.0).unsqueeze(0)  # (1, H, W)
+
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         rec = self.pairs[idx]
-        ref = _load_gray(self.data_dir / rec["reference_path"])
-        search = _load_gray(self.data_dir / rec["search_path"])
+        ref = self._load_gray(self.data_dir / rec["reference_path"])
+        search = self._load_gray(self.data_dir / rec["search_path"])
         gx, gy = rec["gt_x"], rec["gt_y"]
 
         exemplar = resize(ref, [EXEMPLAR_INPUT, EXEMPLAR_INPUT], antialias=True)

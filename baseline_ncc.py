@@ -65,8 +65,10 @@ def main():
     for rec in manifest["pairs"]:
         reference = load_gray(args.data_dir / rec["reference_path"])
         search = load_gray(args.data_dir / rec["search_path"])
+        center = rec.get("mag_ratio", args.mag_ratio)
+        sweep = tuple(center + d for d in (-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0))
         t0 = time.time()
-        px, py = ncc_localize(reference, search, args.mag_ratio)
+        px, py = ncc_localize(reference, search, center, scale_sweep=sweep)
         times.append(time.time() - t0)
         err = float(np.hypot(px - rec["gt_x"], py - rec["gt_y"]))
         errors.append(err)

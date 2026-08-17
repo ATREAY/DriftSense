@@ -56,6 +56,8 @@ def main():
     ap.add_argument("--tolerance-px", type=float, default=30.0,
                      help="Prediction counts as correct if within this L2 pixel distance of ground truth.")
     ap.add_argument("--output-dir", type=Path, default=Path("evaluation_report"))
+    ap.add_argument("--no-ncc-snap", action="store_true",
+                     help="Disable the final local-NCC snap, to measure the learned model alone.")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -79,18 +81,21 @@ def main():
         search = load_gray_tensor(search_path)
 
         t0 = time.time()
-        res = localize(model, reference, search, device=device)
+        res = localize(model, reference, search, device=device, ncc_snap=not args.no_ncc_snap,
+                        mag_ratio=rec.get("mag_ratio", 10))
         dt = time.time() - t0
 
         gt = np.array([rec["gt_x"], rec["gt_y"]])
         pred = np.array([res.x, res.y])
         err = float(np.linalg.norm(gt - pred))
+        model_err = float(np.linalg.norm(gt - np.array([res.model_x, res.model_y])))
         success = err <= args.tolerance_px
 
         row = {"id": rec["id"], "architecture": rec["architecture"],
                "ambiguous_periodic": rec["ambiguous_periodic"],
                "gt_x": rec["gt_x"], "gt_y": rec["gt_y"],
                "pred_x": res.x, "pred_y": res.y,
+               "model_x": res.model_x, "model_y": res.model_y, "model_error_px": model_err,
                "error_px": err, "success": success, "time_sec": dt}
         results.append(row)
 
@@ -100,8 +105,10 @@ def main():
             worst_failure = row
 
     errors = np.array([r["error_px"] for r in results])
+    model_errors = np.array([r["model_error_px"] for r in results])
     times = np.array([r["time_sec"] for r in results])
     accuracy = float(np.mean([r["success"] for r in results]))
+    model_accuracy = float(np.mean(model_errors <= args.tolerance_px))
 
     summary = {
         "num_pairs": len(results),
@@ -109,6 +116,8 @@ def main():
         "accuracy_within_tolerance": accuracy,
         "mean_error_px": float(errors.mean()),
         "median_error_px": float(np.median(errors)),
+        "model_only_accuracy_within_tolerance": model_accuracy,
+        "model_only_mean_error_px": float(model_errors.mean()),
         "mean_time_sec": float(times.mean()),
         "median_time_sec": float(np.median(times)),
     }

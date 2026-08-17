@@ -84,6 +84,13 @@ Key flags:
 - `--ambiguous-prob P` - fraction of samples with ~0 shading cue, i.e.
   the genuinely-hard fully-periodic case the problem statement requires
   at least one instance of
+- `--boundary-bias P` - probability of biasing the reference crop to
+  straddle a mat/strip zone boundary (default 0.35) -- the actual
+  disambiguating signal, see "Current results" below
+- `--mag-ratio R` / `--mag-ratio-jitter-pct P` - base magnification ratio
+  (default 10, matching the problem statement) and how far to jitter it
+  per-pair, for building a scale-variation robustness test set (see
+  `data/scale_variation_eval`)
 - `--workers N` - CPU-parallel generation (each pair is independent)
 
 On a shared cluster, don't run large batches on the login node - use
@@ -139,6 +146,30 @@ Reports accuracy within tolerance, mean/median pixel error, and mean/
 median per-pair inference time; writes one SUCCESS and one HONEST-FAILURE
 visualization (reference, search, predicted vs. true location) to
 `evaluation_report/`.
+
+### What the self-eval set is testing, and why
+
+In response to the organizers' own guidance on Track 2 (no fixed dataset
+size; at least 30 representative cases; diversity over quantity;
+explicitly justify what each case evaluates), `data/self_eval`'s 40 pairs
+and the supplementary `data/scale_variation_eval`'s 24 pairs are built
+around specific, named failure modes rather than being an arbitrary
+random sample:
+
+| Dimension | How it's covered | What it stresses |
+|---|---|---|
+| Architecture balance | 20 DRAM / 20 FinFET, spanning all 12 presets | The algorithm isn't tuned to one die family |
+| Noise | All pairs use the "harder" noise tier (1.8-2.6x the training range) | Robustness to worse-than-training degradation, per the mandatory "test set will be noisier" requirement |
+| Rotation | 0.03-2.98 degrees of independent search-side jitter | Independent-capture geometric drift between reference and search |
+| Repetitive patterns | Every pair is a periodic DRAM/FinFET array by construction | The core structural difficulty of this problem |
+| Genuinely ambiguous cases | 9/40 (22.5%) pairs have zero disambiguating shading/boundary cue | The problem statement's explicit requirement for "at least one highly periodic array region where correct localization is genuinely difficult" -- these are expected failures, and `evaluate.py` reports them separately (`ambiguous_periodic` field) rather than hiding them in the aggregate |
+| Scale variation | Separate `data/scale_variation_eval` set: magnification ratio drawn from 8x-12x per pair (`--mag-ratio-jitter-pct 20`), instead of always exactly the problem statement's ~10x | Whether the localization approach generalizes to a *known but non-standard* magnification, not just the one ratio it was implicitly tuned around. Both `inference.py`/`localize()` and `baseline_ncc.py` take the true ratio as an explicit parameter (never inferred), so this tests correctness of that scale-handling logic specifically, isolated from the noise/pattern-matching problem |
+
+Every pair's manifest record carries the ground-truth parameters that
+produced it (`ambiguous_periodic`, `mag_ratio`, `family`, full noise/
+jitter params), so any accuracy number in this repo can be broken down
+by exactly which of these dimensions it came from, rather than reported
+only as one aggregate.
 
 ## Architecture
 

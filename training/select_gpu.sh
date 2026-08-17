@@ -5,13 +5,19 @@
 # not just partition state -- a node can show ALLOCATED while still
 # having idle GPUs if another job only grabbed some of them).
 #
-# Usage: node=$(training/select_gpu.sh); echo "$node"
-# Prints one node name to stdout. Falls back to the top-priority node
-# (so the job queues there) if nothing is free anywhere right now.
+# Usage: node=$(training/select_gpu.sh [--tiers A100,V100]); echo "$node"
+# --tiers restricts which GPU types are considered (default: all three).
+# Prints one node name to stdout. Falls back to the top-priority
+# considered tier (so the job queues there) if nothing is free right now.
 set -euo pipefail
 
+TIERS="A100,V100,P100"
+if [[ "${1:-}" == "--tiers" ]]; then
+  TIERS="$2"
+fi
+
 # priority-ordered "TYPE NODE" candidates for this cluster
-CANDIDATES=(
+ALL_CANDIDATES=(
   "A100 dgx-a100-02"
   "V100 dgx-v100-01"
   "P100 dgx-p100-01"
@@ -20,6 +26,18 @@ CANDIDATES=(
   "P100 cse-node011"
   "P100 cse-node012"
 )
+
+CANDIDATES=()
+for entry in "${ALL_CANDIDATES[@]}"; do
+  type="${entry%% *}"
+  if [[ ",${TIERS}," == *",${type},"* ]]; then
+    CANDIDATES+=("$entry")
+  fi
+done
+if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
+  echo "[select_gpu] --tiers '$TIERS' matched no candidates" >&2
+  exit 1
+fi
 
 idle_gpus() {
   local node="$1" info state cfg alloc
@@ -44,5 +62,5 @@ for entry in "${CANDIDATES[@]}"; do
   fi
 done
 
-echo "[select_gpu] nothing free right now; falling back to top-priority node (will queue)" >&2
+echo "[select_gpu] nothing free right now within tiers [$TIERS]; falling back to top-priority considered node (will queue)" >&2
 echo "${CANDIDATES[0]#* }"
