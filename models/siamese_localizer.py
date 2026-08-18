@@ -19,14 +19,30 @@ Sub-pixel head + NCC snap (v6): diagnosed directly from v5's results --
 the 25x25 response map has a 16px cell stride, which puts a hard floor on
 precision no matter how well-trained the encoder is, and classical NCC
 (exhaustive per-pixel search, no such floor) already outperformed the
-learned model at tight tolerance. Two additions address this without a
-full redesign: (1) `SubpixelHead` regresses a bounded continuous
-correction from the local neighborhood of the response peak, trained
-end-to-end; (2) `localize()` finishes with a small local NCC search
-(classical, untrained) confined to a window around the model's own
-prediction -- cheap and free of the periodicity-tie problem that a
-whole-image NCC search has, since the model has already narrowed down
-the right neighborhood.
+learned model at tight tolerance. Two additions were built to address
+this: (1) `SubpixelHead` regresses a bounded continuous correction from
+the local neighborhood of the response peak, trained end-to-end; (2)
+`localize()` can finish with a small local NCC search (classical,
+untrained) confined to a window around the model's own prediction.
+
+Measured outcome, honestly: retraining with the sub-pixel head on a 5x
+larger dataset (v6) did *not* beat v5 (worse at every tolerance -- see
+README "Current results"), most likely because batch size was doubled
+without adjusting the learning rate, not because the head itself is
+unsound -- confirmed by zeroing its output layer (a true, provable no-op,
+not just an empirically small one) and re-testing on v5's better base
+predictions. In that clean isolation, `ncc_snap` alone gave a real,
+un-confounded improvement: 0%->7.5% within 5px, 7.5%->12.5% within 30px,
+unchanged at 22.5% within 100px, mean error statistically unchanged
+(within noise). An earlier test that appeared to show snap making things
+worse was confounded by testing it against an *un-zeroed*, randomly-
+initialized subpixel head rather than clean predictions -- worth noting
+as a reminder that ablations need every other variable actually held
+fixed, not just "close enough." `ncc_snap` defaults to True. The shipped
+checkpoint (weights/driftsense.pt) is v5's proven encoder/correlation/
+head weights with the zeroed subpixel head, kept for architecture
+compatibility -- SubpixelHead remains implemented and available, but not
+enabled, since it hasn't yet demonstrated a validated improvement.
 
 Reference:
   - L. Bertinetto et al., "Fully-Convolutional Siamese Networks for Object

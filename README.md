@@ -31,10 +31,12 @@ lattice period; what actually breaks the tie is non-periodic structure in
 the scene itself (real chips are built from periodic array "mats"
 separated by non-periodic routing "strips"). Once the dataset generator
 modeled that, the classical NCC baseline improved dramatically on its
-own, and currently **beats the learned model at tight tolerances**
-(NCC's exhaustive per-pixel search has no quantization floor; the
-learned model's coarse response grid does). Both results, and the honest
-comparison, are in "Current results" - this is a partially-solved
+own. The shipped system uses both: the learned model for its lower mean
+error and better accuracy at the trained ~10x scale, plus a local NCC
+"snap" step to recover precision the model's coarse response grid can't
+reach on its own (NCC's exhaustive per-pixel search has no quantization
+floor). Classical NCC still wins outright on a scale the model never
+trained on (see the scale-variation results) - this is a partially-solved
 problem with a clearly diagnosed remaining gap, not a finished win for
 either approach.
 
@@ -205,26 +207,48 @@ Training loss combines a Gaussian-target heatmap BCE (dense early-training
 signal) with a direct L1 on the soft-argmax coordinate (final precision) -
 see `training/losses.py` and `docs/CITATIONS.md`.
 
+Two more stages sit after this in `localize()`: a `SubpixelHead` regresses
+a bounded correction from the local response-map neighborhood around the
+peak (present in the architecture, currently shipped zeroed - see
+"Current results"), and a final local-NCC "snap" confined to a small
+window around the model's prediction, which *is* enabled and does help
+(same section).
+
 ## Current results & honest limitations
 
-The checkpoint in `weights/driftsense.pt` (config `dram_finfet_v5`, 150
-epochs on 800 training pairs) is the best of five training attempts on
-this cluster, self-evaluated on 40 held-out, harder-noise pairs
-(`data/self_eval`):
+The checkpoint in `weights/driftsense.pt` is v5's encoder/correlation/
+head weights (config `dram_finfet_v5`, 150 epochs on 800 training pairs)
+-- still the best-performing of six training attempts on this cluster --
+plus a sub-pixel refinement head (see below) that ships mathematically
+zeroed (a true, verified no-op) because a later retraining attempt to
+actually train it did not improve on v5. Self-evaluated on 40 held-out,
+harder-noise pairs (`data/self_eval`):
 
-| Metric | DriftSense (learned) | Classical NCC baseline (`baseline_ncc.py`) |
+| Metric | DriftSense (learned + NCC snap) | Classical NCC baseline (`baseline_ncc.py`) |
 |---|---|---|
-| Accuracy within 5px | 0% | 7.5% |
+| Accuracy within 5px | 7.5% | 7.5% |
+| Accuracy within 30px | 12.5% | 12.5% |
 | Accuracy within 100px | 22.5% | 17.5% |
 | Mean error | 322 px | 413 px |
-| Inference time | ~46 ms/pair (CPU) | ~590 ms/pair (CPU, multi-scale) |
+| Inference time | ~50 ms/pair (CPU) | ~850 ms/pair (CPU, multi-scale) |
 
-**This is not a solved localization problem**, and unlike the v1-v4
-numbers below, the learned model no longer cleanly beats the classical
-baseline at every tolerance -- NCC is actually more precise at tight (5px)
-tolerance, while the learned model has a lower mean error and edges ahead
-at loose (100px) tolerance. Reporting the full, mixed picture rather than
-the flattering half of it:
+Plus a dedicated **scale-variation** test (`data/scale_variation_eval`,
+24 pairs, magnification ratio drawn 8x-12x per pair instead of always
+~10x -- see "What the self-eval set is testing" above):
+
+| Metric | DriftSense (learned + NCC snap) | Classical NCC baseline |
+|---|---|---|
+| Accuracy within 100px | 4.2% | 33.3% |
+| Mean error | 349 px | 342 px |
+
+**This is not a solved localization problem**, and it is a genuinely
+mixed result, not a clean win for either method: the learned model is
+noticeably better at the standard ~10x scenario it was trained on
+(22.5% vs. 17.5% @100px, ~25% lower mean error), but classical NCC -- via
+its parameter-free multi-scale sweep, with no learned scale-specific bias
+-- generalizes far better to magnification ratios the model never trained
+on (33.3% vs. 4.2% @100px). Reporting the full picture rather than the
+flattering half of it:
 
 ### What we tried, in order
 
@@ -264,6 +288,31 @@ the flattering half of it:
    before any model retraining. The retrained model (v5, above) improved
    over v1-v4 in absolute terms but is still well below the reference
    scaffold's 60-75%.
+6. **v6** -- targeted precision fixes suggested by an external review of
+   v5's diagnostics: a `SubpixelHead` regressing a bounded correction from
+   the local response-map neighborhood around the soft-argmax peak
+   (addresses the 16px quantization floor below), a post-hoc local-NCC
+   "snap" step confined to a small window around the model's own
+   prediction, and training data scaled 800 -> 5000 pairs. Also fixed a
+   real infrastructure bug found while investigating a 10x per-epoch
+   slowdown on the shared `dgx-a100-02` node: the job requested 8 CPUs
+   while the config asked for 12 dataloader workers; fixed the allocation
+   and added in-RAM image caching (`training/dataset.py`), cutting epoch
+   time from 429s to ~30-40s. Result, measured rigorously rather than
+   assumed: retraining with the sub-pixel head (330 total epochs, 5000
+   pairs) did **not** beat v5 -- worse at every tolerance (12.5% vs.
+   22.5% @100px) despite far more data and compute, most likely because
+   batch size was doubled (16->32) without adjusting the learning rate,
+   not because the head is unsound. Separately, testing the NCC-snap idea
+   in clean isolation (zeroing the subpixel head's output layer -- a
+   *provable* no-op, not just an empirically small one -- and re-running
+   on v5's unmodified predictions) showed it **does** genuinely help:
+   0%->7.5% within 5px, 7.5%->12.5% within 30px, unchanged at 100px, mean
+   error statistically unchanged. That clean result is what's shipped.
+   An earlier, sloppier test that seemed to show NCC-snap hurting was
+   confounded by testing it against an *un-zeroed*, randomly-initialized
+   subpixel head instead of clean predictions -- a reminder that an
+   ablation needs every other variable actually held fixed.
 
 ### Why the gap to the reference scaffold's 60-75% remains
 
@@ -274,29 +323,35 @@ the flattering half of it:
    coarsely periodic (repeats every ~2 mat cells instead of never).
 2. **Coarse-to-fine quantization floor**: the coarse response map has a
    16px cell stride (`ENCODER_STRIDE`), so 5px-tolerance accuracy is
-   structurally hard for this architecture regardless of training quality
-   -- NCC searches every pixel directly and has no such floor, which is
-   likely why it now wins at tight tolerance despite having no learned
-   features at all.
+   structurally hard for this architecture regardless of training quality.
+   The shipped NCC-snap step recovers some of this (see v6 above), but a
+   genuinely trained sub-pixel head remains unvalidated -- v6's attempt
+   was confounded by an unrelated optimizer/batch-size regression, not
+   evidence the idea itself doesn't work.
 3. **Unverified exact calibration**: dose/noise magnitudes were tuned by
    direct measurement on our own data (see `docs/CITATIONS.md`'s NCC
    true-vs-random-score diagnostic), not copied from the scaffold's exact
    `GenerationParams` defaults, which weren't fully recovered from the
    fetched source.
+4. **No generalization to novel scale**: the model was only ever trained
+   at ~10x magnification; the scale-variation test above shows it doesn't
+   zero-shot generalize to 8x-12x nearly as well as parameter-free
+   classical NCC does, even though `localize()` is given the true ratio
+   explicitly. Training data would need to actually include magnification
+   jitter (`--mag-ratio-jitter-pct`, already implemented) for this to
+   improve -- not attempted here given cluster time budget.
 
 ### What would close the remaining gap, in priority order
 
-1. **Full per-mat-cell random preset draws** instead of a 2-preset
+1. **Re-run the v6 sub-pixel-head training with matched hyperparameters**
+   (batch size 16, not 32, or a scaled-up learning rate) to separate the
+   head's real effect from the optimizer regression that confounded v6.
+2. **Full per-mat-cell random preset draws** instead of a 2-preset
    checkerboard, matching the reference scaffold's zone generator exactly.
-2. **A localization head with finer output stride** (e.g. dilate less
-   aggressively, or add a true sub-pixel regression head on top of the
-   coarse cell) to remove the 16px quantization floor for tight-tolerance
-   scoring.
-3. **A classical-NCC hybrid**: fuse the multi-scale NCC score
-   (`baseline_ncc.py`, cheap, no training, currently *more* precise than
-   the learned model at 5px) as an auxiliary prior into the learned
-   heatmap, rather than treating them as competing rather than
-   complementary signals.
+3. **Train with magnification-ratio jitter included**
+   (`--mag-ratio-jitter-pct`, already implemented in the generator) so the
+   model actually sees scale variation during training, not just at
+   inference.
 4. **Orders of magnitude more training pairs** (10K-100K+) -- cheap in
    principle (generation is ~1-2s/pair with 16 workers) but not attempted
    at that scale here given cluster time budget.
